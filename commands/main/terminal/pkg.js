@@ -1,37 +1,122 @@
+const fs = require('node:fs');
+const path = require('node:path');
 const { loadFromDB, saveToDB } = require("../../../db/utils");
 const { createFilesystem } = require("./filesystem");
-const { createDownloadSteps, PACKAGE_SIZES, formatSize } = require("./network");
+const { createDownloadSteps, formatSize } = require("./network");
 
-// OS and package versioning
+// OS version info
 const latestOSVersion = "1.0.0.1";
 const osBranches = {
   stable: latestOSVersion,
   unstable: "1.0.0.2",
 };
 
-// Package definitions with version requirements
-const packageDefinitions = {
-  echo: {
-    stable: { minVersion: "1.0.0" },
-    unstable: { minVersion: "1.0.0" },
-  },
-  edit: {
-    stable: { minVersion: "1.0.0" },
-    unstable: { minVersion: "1.0.0" },
-  },
-  test: {
-    stable: { minVersion: "1.0.0" },
-    unstable: { minVersion: "1.0.0" },
-  },
-  "edit-file": {
-    stable: { minVersion: "1.0.0" },
-    unstable: { minVersion: "1.0.0" },
-  },
-  happyphone: {
-    stable: { minVersion: "1.0.0" },
-    unstable: { minVersion: "1.0.0" },
-  },
-};
+// Package definitions and update sizes
+let packageDefinitions = {};
+const PACKAGE_SIZES = {};
+const UPDATE_SIZES = {};
+
+/**
+ * Load all packages from the packages directory
+ */
+function loadPackages() {
+  const packagesDir = path.join(__dirname, 'packages');
+  
+  // Create directory if it doesn't exist
+  if (!fs.existsSync(packagesDir)) {
+    try {
+      fs.mkdirSync(packagesDir, { recursive: true });
+      console.log(`Created packages directory at ${packagesDir}`);
+    } catch (err) {
+      console.error("Error creating packages directory:", err);
+    }
+    return;
+  }
+  
+  // Read all files in the directory
+  const files = fs.readdirSync(packagesDir);
+  
+  // Process each .js file as a package definition
+  files.forEach(file => {
+    if (file.endsWith('.js')) {
+      try {
+        const packagePath = path.join(packagesDir, file);
+        // Clear cache to ensure we get fresh data
+        delete require.cache[require.resolve(packagePath)];
+        
+        const packageData = require(packagePath);
+        const packageName = packageData.name;
+        
+        if (packageName) {
+          // Store package requirements
+          packageDefinitions[packageName] = {
+            stable: { minVersion: packageData.minVersion?.stable || "1.0.0" },
+            unstable: { minVersion: packageData.minVersion?.unstable || "1.0.0" }
+          };
+          
+          // Store package size
+          PACKAGE_SIZES[packageName] = packageData.size || 1024;
+          
+          // Store package execute function in installable commands
+          if (packageData.execute) {
+            const commandsModule = require('./commands');
+            if (!commandsModule.installableCommands[packageName]) {
+              commandsModule.installableCommands[packageName] = {
+                execute: packageData.execute
+              };
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`Error loading package file ${file}:`, err);
+      }
+    }
+  });
+}
+
+/**
+ * Load all updates from the updates directory
+ */
+function loadUpdates() {
+  const updatesDir = path.join(__dirname, 'updates');
+  
+  // Create directory if it doesn't exist
+  if (!fs.existsSync(updatesDir)) {
+    try {
+      fs.mkdirSync(updatesDir, { recursive: true });
+      console.log(`Created updates directory at ${updatesDir}`);
+    } catch (err) {
+      console.error("Error creating updates directory:", err);
+    }
+    return;
+  }
+  
+  // Read all files in the directory
+  const files = fs.readdirSync(updatesDir);
+  
+  // Process each .js file as an update definition
+  files.forEach(file => {
+    if (file.endsWith('.js')) {
+      try {
+        const updatePath = path.join(updatesDir, file);
+        // Clear cache to ensure we get fresh data
+        delete require.cache[require.resolve(updatePath)];
+        
+        const updateData = require(updatePath);
+        if (updateData.version && updateData.size) {
+          UPDATE_SIZES[updateData.version] = updateData.size;
+          
+          // Update osBranches if necessary
+          if (updateData.branch) {
+            osBranches[updateData.branch] = updateData.version;
+          }
+        }
+      } catch (err) {
+        console.error(`Error loading update file ${file}:`, err);
+      }
+    }
+  });
+}
 
 // Active downloads tracking
 const activeDownloads = new Map();
@@ -65,6 +150,9 @@ function compareVersions(version1, version2) {
  * @returns {boolean} - Whether package is available
  */
 function isPackageAvailable(packageName, osVersion, osBranch) {
+  // Reload package definitions to ensure we have the latest
+  loadPackages();
+
   // If package doesn't exist in definitions
   if (!packageDefinitions[packageName]) return false;
 
@@ -103,6 +191,17 @@ function setDownloadStatus(userId, packageName, downloadState) {
 }
 
 /**
+ * Get OS update size based on version
+ * @param {string} version - OS version to check
+ * @returns {number} - Size of update in KB
+ */
+function getUpdateSize(version) {
+  // Reload updates to ensure we have the latest
+  loadUpdates();
+  return UPDATE_SIZES[version] || 2048; // Default to 2MB if not defined
+}
+
+/**
  * Process the next step in a download
  * @param {string} userId - User ID
  * @param {Object} userFS - User filesystem
@@ -112,6 +211,7 @@ function setDownloadStatus(userId, packageName, downloadState) {
  */
 async function processDownload(userId, userFS, packageName, initialRequest = false) {
   const downloadState = getDownloadStatus(userId, packageName);
+  const isUpdate = packageName.startsWith('update-');
 
   // If a download is already in progress
   if (downloadState) {
@@ -119,39 +219,42 @@ async function processDownload(userId, userFS, packageName, initialRequest = fal
     if (downloadState.currentStep < downloadState.steps.length) {
       const step = downloadState.steps[downloadState.currentStep];
 
-      // If this is a repeat check, check if enough time has passed for next step
+      // For non-initial requests
       if (!initialRequest) {
         const now = Date.now();
-        const elapsed = now - downloadState.lastUpdate;
+        
+        // If it's the final step, install the package or apply the update
+        if (downloadState.currentStep === downloadState.steps.length - 1) {
+          if (isUpdate) {
+            // Handle OS update completion
+            const targetVersion = downloadState.targetVersion;
+            const currentBranch = userFS.fs["/"].children.sys.children.os_branch?.content || "stable";
+            
+            userFS.fs["/"].children.sys.children.os_version.content = targetVersion;
+            
+            await saveToDB("user_filesystems", userId, userFS);
+            setDownloadStatus(userId, packageName, null); // Clear download
+            return `System updated to version ${targetVersion} (${currentBranch} branch)`;
+          } else {
+            // Handle package installation
+            const pkgDir = userFS.fs["/"].children.sys.children.pkgs.children;
+            const currentVersion = userFS.fs["/"].children.sys.children.os_version?.content || "1.0.0";
+            const currentBranch = userFS.fs["/"].children.sys.children.os_branch?.content || "stable";
 
-        if (elapsed >= step.wait) {
-          // Move to next step
-          downloadState.currentStep++;
-          downloadState.lastUpdate = now;
+            // Create package entry
+            pkgDir[`${packageName}.pkg`] = {
+              type: "file",
+              content: `Package: ${packageName}\nVersion: ${currentVersion}\nBranch: ${currentBranch}`,
+            };
 
-          // If we have a next step, return its message
-          if (downloadState.currentStep < downloadState.steps.length) {
-            return downloadState.steps[downloadState.currentStep].message;
+            await saveToDB("user_filesystems", userId, userFS);
+            setDownloadStatus(userId, packageName, null); // Clear download
+            return `Package ${packageName} installed successfully`;
           }
-
-          // Otherwise, this is the final step - install the package
-          const pkgDir = userFS.fs["/"].children.sys.children.pkgs.children;
-          const currentVersion = userFS.fs["/"].children.sys.children.os_version?.content || "1.0.0";
-          const currentBranch = userFS.fs["/"].children.sys.children.os_branch?.content || "stable";
-
-          // Create package entry
-          pkgDir[`${packageName}.pkg`] = {
-            type: "file",
-            content: `Package: ${packageName}\nVersion: ${currentVersion}\nBranch: ${currentBranch}`,
-          };
-
-          await saveToDB("user_filesystems", userId, userFS);
-          setDownloadStatus(userId, packageName, null); // Clear download
-          return `Package ${packageName} installed successfully`;
-        } else {
-          // Not enough time has passed, return current step message
-          return step.message;
         }
+        
+        // Otherwise return the current step's message
+        return step.message;
       } else {
         // Initial request, just show current step
         return step.message;
@@ -159,41 +262,103 @@ async function processDownload(userId, userFS, packageName, initialRequest = fal
     } else {
       // Download is complete, remove tracking
       setDownloadStatus(userId, packageName, null);
-      return `Package ${packageName} installed successfully`;
+      if (isUpdate) {
+        return `System updated to version ${downloadState.targetVersion}`;
+      } else {
+        return `Package ${packageName} installed successfully`;
+      }
     }
   } else if (initialRequest) {
     // Start new download
-    const steps = await createDownloadSteps(userId, packageName);
-
-    // If we have instant download
-    if (steps.length === 1 && steps[0].wait === 0) {
-      const pkgDir = userFS.fs["/"].children.sys.children.pkgs.children;
-      const currentVersion = userFS.fs["/"].children.sys.children.os_version?.content || "1.0.0";
-      const currentBranch = userFS.fs["/"].children.os_branch?.content || "stable";
-
-      // Create package entry immediately
-      pkgDir[`${packageName}.pkg`] = {
-        type: "file",
-        content: `Package: ${packageName}\nVersion: ${currentVersion}\nBranch: ${currentBranch}`,
-      };
-
-      await saveToDB("user_filesystems", userId, userFS);
-      return `Installed package: ${packageName}`;
+    let steps;
+    
+    if (isUpdate) {
+      // For update downloads
+      const targetVersion = packageName.split('-')[1];
+      const updateSize = getUpdateSize(targetVersion);
+      steps = await createDownloadSteps(userId, packageName, updateSize);
+      
+      // If we have instant download
+      if (steps.length === 1 && steps[0].wait === 0) {
+        const currentBranch = userFS.fs["/"].children.sys.children.os_branch?.content || "stable";
+        userFS.fs["/"].children.sys.children.os_version.content = targetVersion;
+        await saveToDB("user_filesystems", userId, userFS);
+        return `System updated to version ${targetVersion} (${currentBranch} branch)`;
+      }
+      
+      // Set up download state with target version
+      setDownloadStatus(userId, packageName, {
+        steps,
+        currentStep: 0,
+        lastUpdate: Date.now(),
+        isUpdate: true,
+        targetVersion
+      });
+      
+      return `Started downloading system update to ${targetVersion}...\n${steps[0].message}`;
+    } else {
+      // For package downloads
+      // Get package size from loaded packages
+      loadPackages();
+      const packageSize = PACKAGE_SIZES[packageName];
+      steps = await createDownloadSteps(userId, packageName, packageSize);
+      
+      // If we have instant download
+      if (steps.length === 1 && steps[0].wait === 0) {
+        const pkgDir = userFS.fs["/"].children.sys.children.pkgs.children;
+        const currentVersion = userFS.fs["/"].children.sys.children.os_version?.content || "1.0.0";
+        const currentBranch = userFS.fs["/"].children.os_branch?.content || "stable";
+        
+        // Create package entry immediately
+        pkgDir[`${packageName}.pkg`] = {
+          type: "file",
+          content: `Package: ${packageName}\nVersion: ${currentVersion}\nBranch: ${currentBranch}`,
+        };
+        
+        await saveToDB("user_filesystems", userId, userFS);
+        return `Installed package: ${packageName}`;
+      }
+      
+      // Set up new download state
+      setDownloadStatus(userId, packageName, {
+        steps,
+        currentStep: 0,
+        lastUpdate: Date.now(),
+      });
+      
+      return `Started downloading ${packageName}...\n${steps[0].message}`;
     }
-
-    // Set up new download state with initial step
-    setDownloadStatus(userId, packageName, {
-      steps,
-      currentStep: 0,
-      lastUpdate: Date.now() - 2000, // Start 2 seconds in the past to make first step advance quickly
-    });
-
-    // Return first step message
-    return `Started downloading ${packageName}...\n${steps[0].message}`;
   } else {
     // No download in progress and not an initial request
     return null;
   }
+}
+
+/**
+ * Start an OS update download simulation
+ * @param {string} userId - User ID 
+ * @param {string} targetVersion - Version to update to
+ * @returns {Promise<Object>} - Initial download state
+ */
+async function startUpdateDownload(userId, targetVersion) {
+  const updateSize = getUpdateSize(targetVersion);
+  
+  // Create download steps using the network simulation
+  const steps = await createDownloadSteps(userId, `update-${targetVersion}`, updateSize);
+  
+  // Set up download state
+  const downloadState = {
+    steps,
+    currentStep: 0,
+    lastUpdate: Date.now(),
+    isUpdate: true,
+    targetVersion
+  };
+  
+  // Register the download
+  setDownloadStatus(userId, `update-${targetVersion}`, downloadState);
+  
+  return downloadState;
 }
 
 /**
@@ -203,6 +368,10 @@ async function processDownload(userId, userFS, packageName, initialRequest = fal
  * @returns {string} - Command output
  */
 async function pkgCommand(userId, args) {
+  // Refresh package and update definitions
+  loadPackages();
+  loadUpdates();
+  
   const subcommand = args[0];
   if (!subcommand) {
     return 'pkg: Missing subcommand. Use "install", "remove", "list", "search", "branches", "status", or "upgrade".';
@@ -243,42 +412,19 @@ async function pkgCommand(userId, args) {
 
     // Handle downgrade scenario - detect if going from unstable to stable
     const isDowngrade = currentBranch === "unstable" && targetBranch === "stable" && compareVersions(currentVersion, targetVersion) > 0;
-
-    // Update OS version and branch
-    sysDir.children.os_version.content = targetVersion;
+    
+    // Change branch first (even if version stays the same)
     sysDir.children.os_branch.content = targetBranch;
-
-    // Ensure OS directory exists with required files
-    if (!sysDir.children.os) {
-      sysDir.children.os = {
-        type: "directory",
-        children: {
-          ".def-vars": { type: "file", content: "$SYS=/sys", readOnly: true, hidden: true },
-          "happy phone.bin": { type: "file", content: "", readOnly: true, hidden: true },
-          "ssh.bin": { type: "file", content: "", readOnly: true, hidden: true },
-          "handler.hpo": { type: "file", content: "", readOnly: true, hidden: true },
-          "peform.hpo": { type: "file", content: "", readOnly: true, hidden: true },
-          "programs.hpo": { type: "file", content: "", readOnly: true, hidden: true },
-        },
-      };
-    } else {
-      const requiredFiles = ["happy phone.bin", "ssh.bin", "handler.hpo", "peform.hpo", "programs.hpo"];
-      for (const file of requiredFiles) {
-        if (!sysDir.children.os.children[file]) {
-          sysDir.children.os.children[file] = { type: "file", content: "", readOnly: true, hidden: true };
-        }
-      }
-      if (!sysDir.children.os.children[".def-vars"]) {
-        sysDir.children.os.children[".def-vars"] = { type: "file", content: "$SYS=/sys", readOnly: true, hidden: true };
-      }
-    }
-
     await saveToDB("user_filesystems", userId, userFS);
 
+    // Start the update download with network simulation
+    const downloadState = await startUpdateDownload(userId, targetVersion);
+    const firstStep = downloadState.steps[0];
+    
     if (isDowngrade) {
-      return `System downgraded from ${currentBranch} (${currentVersion}) to ${targetBranch} (${targetVersion}). Note: Some features may no longer be available.`;
+      return `Starting downgrade from ${currentBranch} (${currentVersion}) to ${targetBranch} (${targetVersion})...\n${firstStep.message}`;
     } else {
-      return `System ${currentVersion === targetVersion ? "switched" : "upgraded"} successfully to version ${targetVersion} (${targetBranch} branch).`;
+      return `Starting system ${currentVersion === targetVersion ? "switch" : "upgrade"} to ${targetVersion} (${targetBranch} branch)...\n${firstStep.message}`;
     }
   }
 
@@ -334,7 +480,9 @@ async function pkgCommand(userId, args) {
       const pageArgIndex = args.indexOf("--page");
       const pageNumber = pageArgIndex !== -1 ? parseInt(args[pageArgIndex + 1], 10) || 1 : 1;
       const pageSize = 5;
-      const installedPackages = Object.keys(pkgDir).map((pkg) => pkg.replace(".pkg", ""));
+      const installedPackages = Object.keys(pkgDir)
+        .map((pkg) => pkg.replace(".pkg", ""))
+        .filter(Boolean);
       const totalPages = Math.max(1, Math.ceil(installedPackages.length / pageSize));
 
       if (pageNumber < 1 || pageNumber > totalPages) {
@@ -346,7 +494,7 @@ async function pkgCommand(userId, args) {
       const pagePackages = installedPackages.slice(start, end);
 
       if (pagePackages.length === 0) {
-        return `pkg: No installed packages on page ${pageNumber}`;
+        return "pkg: No installed packages";
       }
 
       // Add package sizes to the listing
@@ -363,9 +511,13 @@ async function pkgCommand(userId, args) {
       const pageSize = 6;
 
       // Filter available packages based on current OS version and branch
-      const allPackages = Object.keys(packageDefinitions).filter((pkg) => isPackageAvailable(pkg, currentVersion, currentBranch));
+      const allPackages = Object.keys(packageDefinitions).filter((pkg) => 
+        isPackageAvailable(pkg, currentVersion, currentBranch)
+      );
 
-      const filteredPackages = query ? allPackages.filter((pkg) => pkg.toLowerCase().includes(query)) : allPackages;
+      const filteredPackages = query 
+        ? allPackages.filter((pkg) => pkg.toLowerCase().includes(query)) 
+        : allPackages;
 
       const pageArgIndex = args.indexOf("--page");
       const pageNumber = pageArgIndex !== -1 ? parseInt(args[pageArgIndex + 1], 10) || 1 : 1;
@@ -380,7 +532,7 @@ async function pkgCommand(userId, args) {
       const pagePackages = filteredPackages.slice(start, end);
 
       if (pagePackages.length === 0) {
-        return `pkg: No matching packages found for "${query || "all"}" on page ${pageNumber}`;
+        return `pkg: No matching packages found for "${query || "all"}"`;
       }
 
       // Add package sizes to the listing
@@ -434,6 +586,10 @@ async function pkgCommand(userId, args) {
   }
 }
 
+// Initialize by loading packages and updates
+loadPackages();
+loadUpdates();
+
 module.exports = {
   pkgCommand,
   isPackageAvailable,
@@ -442,4 +598,8 @@ module.exports = {
   osBranches,
   processDownload,
   getDownloadStatus,
+  setDownloadStatus,
+  getUpdateSize,
+  startUpdateDownload,
+  PACKAGE_SIZES
 };

@@ -65,14 +65,28 @@ async function calculateDownloadTime(userId, packageName) {
     return { time: 0, size: packageSize };
   }
 
-  // Calculate base download time in milliseconds
-  // Formula: Size in KB * 8 (to bits) / speed in Mbps / 1000
-  const sizeBits = packageSize * 8; // KB to Kb
-  const speedKbps = config.speed * 1000; // Mbps to Kbps
-
-  // Time in milliseconds = (size in Kbits / speed in Kbps) * 1000
-  let downloadTime = (sizeBits / speedKbps) * 1000;
-
+  // IMPORTANT CORRECTION:
+  // packageSize is in KiloBytes (KB)
+  // Network speeds are measured in bits per second (bps)
+  // 1 Byte = 8 bits, so 1 KB = 8 Kb (kilobits)
+  
+  // Convert KB to bits (multiply by 8 * 1024)
+  const sizeInBits = packageSize * 8 * 1024;
+  
+  // Network speed in Mbps (config.speed) converted to bits per second
+  const speedInBitsPerSec = config.speed * 1000000; // Mbps to bps
+  
+  // Calculate time in seconds (size in bits / speed in bits per second)
+  let downloadTimeSeconds = sizeInBits / speedInBitsPerSec;
+  
+  // Convert to milliseconds
+  let downloadTime = downloadTimeSeconds * 1000;
+  
+  // For very high speeds, ensure minimum download time is at least a few ms
+  if (downloadTime < 30) {
+    return { time: 0, size: packageSize }; // Consider it instant
+  }
+  
   // Add network conditions
   downloadTime += config.latency;
 
@@ -101,10 +115,13 @@ async function calculateDownloadTime(userId, packageName) {
  * @returns {string} - Formatted size string
  */
 function formatSize(sizeKB) {
-  if (sizeKB < 1024) {
-    return `${sizeKB} KB`;
+  // Ensure we have at most 2 decimal places
+  const formattedSize = Number.isInteger(sizeKB) ? sizeKB : Number(sizeKB.toFixed(2));
+  
+  if (formattedSize < 1024) {
+    return `${formattedSize} KB`;
   } else {
-    return `${(sizeKB / 1024).toFixed(2)} MB`;
+    return `${(formattedSize / 1024).toFixed(2)} MB`;
   }
 }
 
@@ -130,51 +147,53 @@ function formatTime(timeMs) {
 async function createDownloadSteps(userId, packageName) {
   const { time, size } = await calculateDownloadTime(userId, packageName);
   const config = await getUserNetworkConfig(userId);
-
-  if (time === 0 || !config.enabled) {
-    return [
-      {
-        progress: 100,
-        message: `Downloaded ${formatSize(size)} instantly`,
-        wait: 0,
-        complete: true,
-      },
-    ];
+  
+  if (time === 0 || !config.enabled || time < 100) {
+    return [{ 
+      progress: 100, 
+      message: `Downloaded ${formatSize(size)} instantly`,
+      wait: 0,
+      complete: true
+    }];
   }
-
-  // Create more granular steps (20 steps for more detailed progress)
-  const stepCount = 20;
-  const stepSize = 100 / stepCount; // 5% increments
-  const baseStepTime = Math.max(500, Math.round(time / stepCount)); // ms per step, minimum 0.5 second
+  
+  // Calculate how many updates we'll show based on download time
+  // We'll show an update every 1.5 seconds
+  const updateInterval = 1500; // ms
+  const numUpdates = Math.max(3, Math.ceil(time / updateInterval));
+  
+  // Calculate download throughput
+  const bytesPerMs = size / time;
   const steps = [];
-
-  // Generate steps with consistent timing but random small variations
-  for (let i = 0; i < stepCount; i++) {
-    // Calculate exact percentage for this step (5%, 10%, 15%, etc.)
-    const progress = (i + 1) * stepSize;
-    const isComplete = i === stepCount - 1;
-
-    // Calculate exact download amount for this percentage
-    const downloadedAmount = (size * progress) / 100;
-
-    // Small speed variation for each step (±10%)
-    const speedVariation = 1 + (Math.random() * 0.2 - 0.1);
-    // Ensure minimum wait time of 500ms (0.5s) but keep total time roughly the same
-    const waitTime = Math.max(500, Math.round(baseStepTime * speedVariation));
-
-    // Format the progress to one decimal place
-    const formattedProgress = progress.toFixed(1);
-
+  
+  // Generate steps with consistent timing
+  for (let i = 0; i < numUpdates; i++) {
+    const isComplete = i === numUpdates - 1;
+    
+    // Calculate wait time (with small variation)
+    const waitTime = isComplete ? 
+      Math.max(500, time - (i * updateInterval)) : // Final step takes remaining time
+      updateInterval * (0.9 + Math.random() * 0.2); // Regular steps take ~1.5s with variation
+    
+    // Calculate how much will be downloaded by this step
+    const elapsedTime = i * updateInterval;
+    const downloadedAmount = isComplete ? 
+      size : // Final step shows full size 
+      Math.min(size, bytesPerMs * elapsedTime);
+    
+    // Calculate progress percentage
+    const progress = (downloadedAmount / size) * 100;
+    
     steps.push({
       progress,
-      message: isComplete
+      message: isComplete 
         ? `Downloaded ${formatSize(size)} in ${formatTime(time)}`
-        : `Downloading ${packageName}... ${formattedProgress}% (${formatSize(downloadedAmount.toFixed(1))}/${formatSize(size)})`,
+        : `Downloading ${packageName}... ${progress.toFixed(1)}% (${formatSize(downloadedAmount)}/${formatSize(size)})`,
       wait: waitTime,
-      complete: isComplete,
+      complete: isComplete
     });
   }
-
+  
   return steps;
 }
 
@@ -190,66 +209,72 @@ async function recalculateDownloadSteps(userId, packageName, downloadState) {
   if (!downloadState || downloadState.currentStep >= downloadState.steps.length) {
     return downloadState;
   }
-
+  
   const { time, size } = await calculateDownloadTime(userId, packageName);
   const config = await getUserNetworkConfig(userId);
-
-  if (time === 0 || !config.enabled) {
-    // Instant download, complete it immediately
+  
+  // For instant downloads or disabled network sim, complete immediately
+  if (time === 0 || !config.enabled || time < 100) {
     downloadState.currentStep = downloadState.steps.length - 1;
     return downloadState;
   }
-
+  
   // Calculate how much has been downloaded so far
   const currentProgress = downloadState.steps[downloadState.currentStep].progress;
   const downloadedAmount = (size * currentProgress) / 100;
   const remainingSize = size - downloadedAmount;
-
+  
   // Calculate time for remaining download based on new speed
-  const remainingSizeBits = remainingSize * 8; // KB to Kb
-  const speedKbps = config.speed * 1000; // Mbps to Kbps
-  const remainingTime = (remainingSizeBits / speedKbps) * 1000;
-
-  // Calculate how many steps remain
-  const totalSteps = 20; // Same as in createDownloadSteps
-  const stepsRemaining = Math.ceil((100 - currentProgress) / 5); // 5% per step
-
-  if (stepsRemaining <= 0) {
-    // Almost done, don't change anything
-    return downloadState;
-  }
-
-  // Calculate new timing for remaining steps
-  const stepSize = (100 - currentProgress) / stepsRemaining;
-  const baseStepTime = Math.max(200, Math.round(remainingTime / stepsRemaining));
-
+  // CORRECTED: Convert KB to bits properly
+  const remainingSizeInBits = remainingSize * 8 * 1024; // KB to bits
+  const speedInBitsPerSec = config.speed * 1000000; // Mbps to bps
+  const remainingTimeSeconds = remainingSizeInBits / speedInBitsPerSec;
+  const remainingTimeMs = Math.max(100, remainingTimeSeconds * 1000);
+  
+  // Calculate how many updates we'll show based on remaining download time
+  const updateInterval = 1500; // ms
+  const numUpdates = Math.max(1, Math.ceil(remainingTimeMs / updateInterval));
+  
+  // Calculate new bytes per ms throughput
+  const bytesPerMs = remainingSize / remainingTimeMs;
+  
   // Create new steps starting from current progress
   const newSteps = [];
-  for (let i = 0; i < stepsRemaining; i++) {
-    const progress = currentProgress + (i + 1) * stepSize;
-    const isComplete = i === stepsRemaining - 1 || progress >= 100;
-    const actualProgress = Math.min(progress, 100);
-
-    // Calculate download amount for this step
-    const stepDownloadedAmount = (size * actualProgress) / 100;
-
-    // Add variation for more realism
-    const speedVariation = 1 + (Math.random() * 0.2 - 0.1); // ±10% variation
-    const waitTime = Math.max(200, Math.round(baseStepTime * speedVariation));
-
+  for (let i = 0; i < numUpdates; i++) {
+    const isComplete = i === numUpdates - 1;
+    
+    // Calculate wait time
+    const waitTime = isComplete ?
+      Math.max(500, remainingTimeMs - (i * updateInterval)) : // Final step takes remaining time
+      updateInterval * (0.9 + Math.random() * 0.2); // Regular steps take ~1.5s with variation
+      
+    // Calculate how much more will be downloaded by this step
+    const elapsedTime = i * updateInterval;
+    const additionalDownloaded = isComplete ?
+      remainingSize : // Final step completes the download
+      Math.min(remainingSize, bytesPerMs * elapsedTime);
+    
+    const stepDownloadedAmount = downloadedAmount + additionalDownloaded;
+    
+    // Calculate progress percentage
+    const progress = (stepDownloadedAmount / size) * 100;
+    
     newSteps.push({
-      progress: actualProgress,
-      message: isComplete
-        ? `Downloaded ${formatSize(size)} in ${formatTime(remainingTime + (currentProgress / 100) * time)}`
-        : `Downloading ${packageName}... ${actualProgress.toFixed(1)}% (${formatSize(stepDownloadedAmount)}/${formatSize(size)})`,
+      progress,
+      message: isComplete 
+        ? `Downloaded ${formatSize(size)} in ${formatTime(time * (currentProgress / 100) + remainingTimeMs)}`
+        : `Downloading ${packageName}... ${progress.toFixed(1)}% (${formatSize(stepDownloadedAmount)}/${formatSize(size)})`,
       wait: waitTime,
-      complete: isComplete,
+      complete: isComplete
     });
   }
-
-  // Keep completed steps, replace remaining ones
-  downloadState.steps = [...downloadState.steps.slice(0, downloadState.currentStep + 1), ...newSteps];
-
+  
+  // Replace remaining steps
+  downloadState.steps = [
+    ...downloadState.steps.slice(0, downloadState.currentStep + 1),
+    ...newSteps
+  ];
+  
   return downloadState;
 }
 

@@ -228,6 +228,34 @@ async function handleTerminalInput(interaction, userId) {
   const currentDir = userFS.currentDir;
   const username = interaction.user.username;
 
+  // IMPORTANT FIX: Check for and complete any pending downloads before processing new command
+  const pkgModule = require("./terminal/pkg");
+  const pkgNames = Object.keys(pkgModule.packageDefinitions);
+  let downloadMessages = [];
+  
+  // Complete all downloads immediately
+  for (const pkgName of pkgNames) {
+    const downloadState = pkgModule.getDownloadStatus(userId, pkgName);
+    if (downloadState && downloadState.currentStep < downloadState.steps.length) {
+      // Skip to the last step
+      downloadState.currentStep = downloadState.steps.length - 1;
+      pkgModule.setDownloadStatus(userId, pkgName, downloadState);
+      
+      // Process the final step to complete the download
+      const fs = await loadFromDB("user_filesystems", userId, createFilesystem());
+      const updateMsg = await pkgModule.processDownload(userId, fs, pkgName, false);
+      
+      if (updateMsg) {
+        downloadMessages.push(updateMsg);
+      }
+    }
+  }
+  
+  // Add any download completion messages to the history before the new command
+  if (downloadMessages.length > 0) {
+    histories.push(downloadMessages.join("\n"));
+  }
+
   // Add main command prompt to history
   let promptLine = `${username}@happyphone:${currentDir}$ ${commandField}`;
   histories.push(promptLine);
@@ -279,6 +307,7 @@ async function checkActiveDownloads(userId, interaction, histories) {
     const pkgNames = Object.keys(pkgModule.packageDefinitions);
 
     let hasUpdates = false;
+    let downloadCompleted = false;
 
     for (const pkgName of pkgNames) {
       const downloadState = pkgModule.getDownloadStatus(userId, pkgName);
@@ -286,15 +315,33 @@ async function checkActiveDownloads(userId, interaction, histories) {
         // Get fresh filesystem for updating
         const fs = await loadFromDB("user_filesystems", userId, createFilesystem());
 
-        // Update the download progress (this will install the package if complete)
-        const updateMsg = await pkgModule.processDownload(userId, fs, pkgName, false);
-
-        if (updateMsg) {
-          // Check if this is the same message as the last one
-          const lastMessage = histories[histories.length - 1];
-          if (lastMessage !== updateMsg) {
-            histories.push(updateMsg);
-            hasUpdates = true;
+        // Calculate elapsed time since last update to see if it's time for next step
+        const now = Date.now();
+        const elapsed = now - downloadState.lastUpdate;
+        const currentStep = downloadState.steps[downloadState.currentStep];
+        
+        // Check if we should advance to the next step
+        if (elapsed >= currentStep.wait) {
+          // Move to next step
+          downloadState.currentStep++;
+          downloadState.lastUpdate = now;
+          
+          // Process the step (this will install the package if complete)
+          const updateMsg = await pkgModule.processDownload(userId, fs, pkgName, false);
+          
+          if (updateMsg) {
+            // Check if this is the same message as the last one
+            const lastMessage = histories[histories.length - 1];
+            if (lastMessage !== updateMsg) {
+              histories.push(updateMsg);
+              hasUpdates = true;
+            }
+          }
+          
+          // Check if we've completed all steps
+          if (downloadState.currentStep >= downloadState.steps.length || 
+              !pkgModule.getDownloadStatus(userId, pkgName)) {
+            downloadCompleted = true;
           }
         }
       }
@@ -305,22 +352,20 @@ async function checkActiveDownloads(userId, interaction, histories) {
       histories = histories.slice(-MAX_HISTORY_SIZE);
       await saveToDB("user_histories", userId, histories);
       await interaction.editReply({ content: `\`\`\`\n${histories.join("\n")}\n\`\`\`` });
-
-      // Continue checking if there are active downloads
-      const hasActiveDownloads = pkgNames.some((pkgName) => {
-        const state = pkgModule.getDownloadStatus(userId, pkgName);
-        return state && state.currentStep < state.steps.length;
-      });
-
-      if (hasActiveDownloads) {
-        // Set up next check in 0.5 seconds for more frequent updates
-        setTimeout(() => checkActiveDownloads(userId, interaction, histories), 500);
-      }
-
-      return true;
     }
 
-    return false;
+    // Continue checking if there are active downloads
+    const hasActiveDownloads = pkgNames.some((pkgName) => {
+      const state = pkgModule.getDownloadStatus(userId, pkgName);
+      return state && state.currentStep < state.steps.length;
+    });
+
+    if (hasActiveDownloads) {
+      // Set up next check in 100ms for more frequent updates
+      setTimeout(() => checkActiveDownloads(userId, interaction, histories), 100);
+    }
+
+    return hasUpdates;
   } catch (err) {
     console.error("Error checking downloads:", err);
     return false;

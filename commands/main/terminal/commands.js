@@ -131,8 +131,14 @@ const systemCommands = {
         return "Usage: netset <unit> <value>\nAvailable units: bps, kbps, mbps, gbps, tbps";
       }
       
+      // Move unit and value parsing to separate lines for clarity
       const unit = args[0].toLowerCase();
-      const value = parseFloat(args[1]);
+      let value;
+      try {
+        value = parseFloat(args[1]);
+      } catch (e) {
+        return "Invalid speed value. Please provide a valid number.";
+      }
       
       if (isNaN(value) || value <= 0) {
         return "Invalid speed value. Please provide a positive number.";
@@ -186,8 +192,7 @@ const systemCommands = {
       }
       
       // Return a message indicating the change
-      const speedDisplay = unit === "mbps" ? speedInMbps : value;
-      return `Network speed set to ${speedDisplay} ${unit.toUpperCase()} (${speedInMbps} Mbps)`;
+      return `Network speed set to ${value} ${unit.toUpperCase()} (${speedInMbps} Mbps)`;
     },
   },
 
