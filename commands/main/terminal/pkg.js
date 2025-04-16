@@ -16,6 +16,9 @@ let packageDefinitions = {};
 const PACKAGE_SIZES = {};
 const UPDATE_SIZES = {};
 
+// Store package executors separately to avoid circular dependencies
+const packageExecutors = {};
+
 /**
  * Load all packages from the packages directory
  */
@@ -57,14 +60,9 @@ function loadPackages() {
           // Store package size
           PACKAGE_SIZES[packageName] = packageData.size || 1024;
           
-          // Store package execute function in installable commands
+          // Store package execute function in our local map instead of directly accessing commands.js
           if (packageData.execute) {
-            const commandsModule = require('./commands');
-            if (!commandsModule.installableCommands[packageName]) {
-              commandsModule.installableCommands[packageName] = {
-                execute: packageData.execute
-              };
-            }
+            packageExecutors[packageName] = packageData.execute;
           }
         }
       } catch (err) {
@@ -116,6 +114,27 @@ function loadUpdates() {
       }
     }
   });
+}
+
+/**
+ * Register package executors with the commands module
+ * This should be called after both modules are initialized
+ */
+function registerPackageCommands() {
+  try {
+    const commandsModule = require('./commands');
+    
+    // Register each package executor with the commands module
+    for (const [packageName, executor] of Object.entries(packageExecutors)) {
+      if (!commandsModule.installableCommands[packageName]) {
+        commandsModule.installableCommands[packageName] = {
+          execute: executor
+        };
+      }
+    }
+  } catch (err) {
+    console.error("Error registering package commands:", err);
+  }
 }
 
 // Active downloads tracking
@@ -219,49 +238,52 @@ async function processDownload(userId, userFS, packageName, initialRequest = fal
     if (downloadState.currentStep < downloadState.steps.length) {
       const step = downloadState.steps[downloadState.currentStep];
 
-      // For non-initial requests
-      if (!initialRequest) {
-        const now = Date.now();
-        
-        // If it's the final step, install the package or apply the update
-        if (downloadState.currentStep === downloadState.steps.length - 1) {
-          if (isUpdate) {
-            // Handle OS update completion
-            const targetVersion = downloadState.targetVersion;
-            const currentBranch = userFS.fs["/"].children.sys.children.os_branch?.content || "stable";
-            
-            userFS.fs["/"].children.sys.children.os_version.content = targetVersion;
-            
-            await saveToDB("user_filesystems", userId, userFS);
-            setDownloadStatus(userId, packageName, null); // Clear download
-            return `System updated to version ${targetVersion} (${currentBranch} branch)`;
-          } else {
-            // Handle package installation
-            const pkgDir = userFS.fs["/"].children.sys.children.pkgs.children;
-            const currentVersion = userFS.fs["/"].children.sys.children.os_version?.content || "1.0.0";
-            const currentBranch = userFS.fs["/"].children.sys.children.os_branch?.content || "stable";
-
-            // Create package entry
-            pkgDir[`${packageName}.pkg`] = {
-              type: "file",
-              content: `Package: ${packageName}\nVersion: ${currentVersion}\nBranch: ${currentBranch}`,
-            };
-
-            await saveToDB("user_filesystems", userId, userFS);
-            setDownloadStatus(userId, packageName, null); // Clear download
-            return `Package ${packageName} installed successfully`;
-          }
-        }
-        
-        // Otherwise return the current step's message
-        return step.message;
-      } else {
-        // Initial request, just show current step
+      // For initial requests, return current step message
+      if (initialRequest) {
         return step.message;
       }
+
+      // For final step, install the package or apply the update
+      if (downloadState.currentStep === downloadState.steps.length - 1 && step.complete) {
+        if (isUpdate) {
+          // Handle OS update completion
+          const targetVersion = downloadState.targetVersion;
+          const currentBranch = userFS.fs["/"].children.sys.children.os_branch?.content || "stable";
+          
+          // Update OS version
+          userFS.fs["/"].children.sys.children.os_version.content = targetVersion;
+          
+          // Save and clear the download status
+          await saveToDB("user_filesystems", userId, userFS);
+          setDownloadStatus(userId, packageName, null); // Clear download
+          
+          return `System updated to version ${targetVersion} (${currentBranch} branch)`;
+        } else {
+          // Handle package installation
+          const pkgDir = userFS.fs["/"].children.sys.children.pkgs.children;
+          const currentVersion = userFS.fs["/"].children.sys.children.os_version?.content || "1.0.0";
+          const currentBranch = userFS.fs["/"].children.sys.children.os_branch?.content || "stable";
+
+          // Create package entry
+          pkgDir[`${packageName}.pkg`] = {
+            type: "file",
+            content: `Package: ${packageName}\nVersion: ${currentVersion}\nBranch: ${currentBranch}`,
+          };
+
+          // Save and clear the download status
+          await saveToDB("user_filesystems", userId, userFS);
+          setDownloadStatus(userId, packageName, null); // Clear download
+          
+          return `Package ${packageName} installed successfully`;
+        }
+      }
+      
+      // Return the current step message for ongoing downloads
+      return step.message;
     } else {
       // Download is complete, remove tracking
       setDownloadStatus(userId, packageName, null);
+      
       if (isUpdate) {
         return `System updated to version ${downloadState.targetVersion}`;
       } else {
@@ -269,8 +291,9 @@ async function processDownload(userId, userFS, packageName, initialRequest = fal
       }
     }
   } else if (initialRequest) {
-    // Start new download
+    // Start a new download
     let steps;
+    const config = await require("./network").getUserNetworkConfig(userId);
     
     if (isUpdate) {
       // For update downloads
@@ -278,12 +301,12 @@ async function processDownload(userId, userFS, packageName, initialRequest = fal
       const updateSize = getUpdateSize(targetVersion);
       steps = await createDownloadSteps(userId, packageName, updateSize);
       
-      // If we have instant download
-      if (steps.length === 1 && steps[0].wait === 0) {
+      // Only allow instant download if network simulation is disabled
+      if (steps.length === 1 && steps[0].wait === 0 && !config.enabled) {
         const currentBranch = userFS.fs["/"].children.sys.children.os_branch?.content || "stable";
         userFS.fs["/"].children.sys.children.os_version.content = targetVersion;
         await saveToDB("user_filesystems", userId, userFS);
-        return `System updated to version ${targetVersion} (${currentBranch} branch)`;
+        return `System updated to version ${targetVersion} (${currentBranch} branch) instantly`;
       }
       
       // Set up download state with target version
@@ -300,14 +323,14 @@ async function processDownload(userId, userFS, packageName, initialRequest = fal
       // For package downloads
       // Get package size from loaded packages
       loadPackages();
-      const packageSize = PACKAGE_SIZES[packageName];
+      const packageSize = PACKAGE_SIZES[packageName] || 1024;
       steps = await createDownloadSteps(userId, packageName, packageSize);
       
-      // If we have instant download
-      if (steps.length === 1 && steps[0].wait === 0) {
+      // Only allow instant download if network simulation is disabled
+      if (steps.length === 1 && steps[0].wait === 0 && !config.enabled) {
         const pkgDir = userFS.fs["/"].children.sys.children.pkgs.children;
         const currentVersion = userFS.fs["/"].children.sys.children.os_version?.content || "1.0.0";
-        const currentBranch = userFS.fs["/"].children.os_branch?.content || "stable";
+        const currentBranch = userFS.fs["/"].children.sys.children.os_branch?.content || "stable";
         
         // Create package entry immediately
         pkgDir[`${packageName}.pkg`] = {
@@ -316,7 +339,7 @@ async function processDownload(userId, userFS, packageName, initialRequest = fal
         };
         
         await saveToDB("user_filesystems", userId, userFS);
-        return `Installed package: ${packageName}`;
+        return `Installed package: ${packageName} instantly`;
       }
       
       // Set up new download state
@@ -590,6 +613,7 @@ async function pkgCommand(userId, args) {
 loadPackages();
 loadUpdates();
 
+// Export registerPackageCommands so it can be called after all modules are loaded
 module.exports = {
   pkgCommand,
   isPackageAvailable,
@@ -601,5 +625,6 @@ module.exports = {
   setDownloadStatus,
   getUpdateSize,
   startUpdateDownload,
-  PACKAGE_SIZES
+  PACKAGE_SIZES,
+  registerPackageCommands
 };

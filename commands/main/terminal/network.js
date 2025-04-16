@@ -55,11 +55,12 @@ async function saveUserNetworkConfig(userId, config) {
  * Calculate download time for a package based on network speed
  * @param {string} userId - User ID
  * @param {string} packageName - Package name
+ * @param {number} packageSizeKB - Size of package in KB
  * @returns {Object} - Download time details
  */
-async function calculateDownloadTime(userId, packageName) {
+async function calculateDownloadTime(userId, packageName, packageSizeKB) {
   const config = await getUserNetworkConfig(userId);
-  const packageSize = PACKAGE_SIZES[packageName] || 1024; // Default to 1MB if not specified
+  const packageSize = packageSizeKB || PACKAGE_SIZES[packageName] || 1024; // Default to 1MB if not specified
 
   if (!config.enabled) {
     return { time: 0, size: packageSize };
@@ -82,10 +83,10 @@ async function calculateDownloadTime(userId, packageName) {
   // Convert to milliseconds
   let downloadTime = downloadTimeSeconds * 1000;
   
-  // For very high speeds, ensure minimum download time is at least a few ms
-  if (downloadTime < 30) {
-    return { time: 0, size: packageSize }; // Consider it instant
-  }
+  // For simulation purposes, enforce minimum download time based on package size
+  // Even small packages should take some time to download for better user experience
+  const minTime = Math.min(1000, packageSize); // At least 1ms per KB up to 1 second
+  downloadTime = Math.max(minTime, downloadTime);
   
   // Add network conditions
   downloadTime += config.latency;
@@ -110,90 +111,49 @@ async function calculateDownloadTime(userId, packageName) {
 }
 
 /**
- * Format size in human-readable format
- * @param {number} sizeKB - Size in KB
- * @returns {string} - Formatted size string
+ * Create download steps that update every 1.5 seconds showing real progress
  */
-function formatSize(sizeKB) {
-  // Ensure we have at most 2 decimal places
-  const formattedSize = Number.isInteger(sizeKB) ? sizeKB : Number(sizeKB.toFixed(2));
-  
-  if (formattedSize < 1024) {
-    return `${formattedSize} KB`;
-  } else {
-    return `${(formattedSize / 1024).toFixed(2)} MB`;
-  }
-}
-
-/**
- * Format time in appropriate units
- * @param {number} timeMs - Time in milliseconds
- * @returns {string} - Formatted time string
- */
-function formatTime(timeMs) {
-  if (timeMs < 1000) {
-    return `${timeMs} ms`;
-  } else {
-    return `${(timeMs / 1000).toFixed(2)} seconds`;
-  }
-}
-
-/**
- * Create all steps for a download simulation
- * @param {string} userId - User ID
- * @param {string} packageName - Package name
- * @returns {Array} - Array of progress steps
- */
-async function createDownloadSteps(userId, packageName) {
-  const { time, size } = await calculateDownloadTime(userId, packageName);
+async function createDownloadSteps(userId, packageName, packageSizeKB) {
+  const size = packageSizeKB || PACKAGE_SIZES[packageName] || 1024;
+  const { time } = await calculateDownloadTime(userId, packageName, size);
   const config = await getUserNetworkConfig(userId);
-  
-  if (time === 0 || !config.enabled || time < 100) {
-    return [{ 
-      progress: 100, 
+
+  // If simulation disabled, one instant step
+  if (!config.enabled) {
+    return [{
+      progress: 100,
       message: `Downloaded ${formatSize(size)} instantly`,
       wait: 0,
       complete: true
     }];
   }
-  
-  // Calculate how many updates we'll show based on download time
-  // We'll show an update every 1.5 seconds
-  const updateInterval = 1500; // ms
-  const numUpdates = Math.max(3, Math.ceil(time / updateInterval));
-  
-  // Calculate download throughput
-  const bytesPerMs = size / time;
+
+  const interval = 1500; // ms
+  const numUpdates = Math.ceil(time / interval);
   const steps = [];
-  
-  // Generate steps with consistent timing
-  for (let i = 0; i < numUpdates; i++) {
-    const isComplete = i === numUpdates - 1;
-    
-    // Calculate wait time (with small variation)
-    const waitTime = isComplete ? 
-      Math.max(500, time - (i * updateInterval)) : // Final step takes remaining time
-      updateInterval * (0.9 + Math.random() * 0.2); // Regular steps take ~1.5s with variation
-    
-    // Calculate how much will be downloaded by this step
-    const elapsedTime = i * updateInterval;
-    const downloadedAmount = isComplete ? 
-      size : // Final step shows full size 
-      Math.min(size, bytesPerMs * elapsedTime);
-    
-    // Calculate progress percentage
-    const progress = (downloadedAmount / size) * 100;
-    
+
+  for (let i = 1; i <= numUpdates; i++) {
+    const isLast = i === numUpdates;
+    const wait = isLast
+      ? Math.max(50, time - interval * (numUpdates - 1))
+      : interval;
+
+    const elapsed = Math.min(time, i * interval);
+    const progress = Math.round((elapsed / time) * 100 * 10) / 10; // one decimal
+
+    const downloaded = (size * elapsed) / time;
+    const message = isLast
+      ? `Downloaded ${formatSize(size)} in ${formatTime(time)}`
+      : `Downloading ${packageName}... ${progress.toFixed(1)}% (${formatSize(downloaded)}/${formatSize(size)})`;
+
     steps.push({
-      progress,
-      message: isComplete 
-        ? `Downloaded ${formatSize(size)} in ${formatTime(time)}`
-        : `Downloading ${packageName}... ${progress.toFixed(1)}% (${formatSize(downloadedAmount)}/${formatSize(size)})`,
-      wait: waitTime,
-      complete: isComplete
+      progress: isLast ? 100 : progress,
+      message,
+      wait,
+      complete: isLast
     });
   }
-  
+
   return steps;
 }
 
@@ -276,6 +236,33 @@ async function recalculateDownloadSteps(userId, packageName, downloadState) {
   ];
   
   return downloadState;
+}
+
+/**
+ * Format size in human-readable format
+ * @param {number} sizeKB - Size in KB
+ * @returns {string}
+ */
+function formatSize(sizeKB) {
+  const formattedSize = Number.isInteger(sizeKB) ? sizeKB : Number(sizeKB.toFixed(2));
+  if (formattedSize < 1024) {
+    return `${formattedSize} KB`;
+  } else {
+    return `${(formattedSize / 1024).toFixed(2)} MB`;
+  }
+}
+
+/**
+ * Format time in appropriate units
+ * @param {number} timeMs - Time in milliseconds
+ * @returns {string}
+ */
+function formatTime(timeMs) {
+  if (timeMs < 1000) {
+    return `${timeMs} ms`;
+  } else {
+    return `${(timeMs / 1000).toFixed(2)} seconds`;
+  }
 }
 
 module.exports = {

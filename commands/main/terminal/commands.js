@@ -2,7 +2,12 @@ const path = require("node:path");
 const { loadFromDB, saveToDB } = require("../../../db/utils");
 const { resolvePath, getObjectAtPath, createFilesystem, MAX_CONTENT_LENGTH } = require("./filesystem");
 const { getUserNetworkConfig, saveUserNetworkConfig } = require("./network");
-const { processDownload, getDownloadStatus } = require("./pkg");
+
+// Import pkgModule directly for the packageDefinitions only
+// We'll register the package commands separately to avoid circular dependencies
+const pkgModule = require("./pkg");
+const { getDownloadStatus, processDownload } = pkgModule;
+const { packageDefinitions } = pkgModule;
 
 // System commands that are always available
 const systemCommands = {
@@ -128,70 +133,53 @@ const systemCommands = {
   netset: {
     execute: async (userId, args) => {
       if (args.length < 2) {
-        return "Usage: netset <unit> <value>\nAvailable units: bps, kbps, mbps, gbps, tbps";
+        return "Usage: netset <unit> <value> or netset <value> <unit>\nAvailable units: bps, kbps, mbps, gbps, tbps";
       }
-      
-      // Move unit and value parsing to separate lines for clarity
-      const unit = args[0].toLowerCase();
-      let value;
-      try {
-        value = parseFloat(args[1]);
-      } catch (e) {
-        return "Invalid speed value. Please provide a valid number.";
+
+      let unit = args[0].toLowerCase();
+      let value = parseFloat(args[1]);
+      // If second arg isn't a number but first is, swap
+      if (isNaN(value) && !isNaN(parseFloat(args[0]))) {
+        value = parseFloat(args[0]);
+        unit = args[1].toLowerCase();
       }
-      
+
       if (isNaN(value) || value <= 0) {
         return "Invalid speed value. Please provide a positive number.";
       }
-      
-      // Get the network config for the user
+
       const { getUserNetworkConfig, saveUserNetworkConfig, recalculateDownloadSteps } = require("./network");
       const config = await getUserNetworkConfig(userId);
-      
-      // Convert input to Mbps based on unit
+
+      // Normalize unit into Mbps
       let speedInMbps;
       switch (unit) {
-        case "bps":
-          speedInMbps = value / 1000000; // 1M bps = 1 Mbps
-          break;
-        case "kbps":
-          speedInMbps = value / 1000; // 1000 Kbps = 1 Mbps
-          break;
-        case "mbps":
-          speedInMbps = value;
-          break;
-        case "gbps":
-          speedInMbps = value * 1000; // 1 Gbps = 1000 Mbps
-          break;
-        case "tbps":
-          speedInMbps = value * 1000000; // 1 Tbps = 1,000,000 Mbps
-          break;
+        case "bps":   speedInMbps = value / 1e6; break;
+        case "kbps":  speedInMbps = value / 1e3; break;
+        case "mbps":  speedInMbps = value;      break;
+        case "gbps":  speedInMbps = value * 1e3;break;
+        case "tbps":  speedInMbps = value * 1e6;break;
         default:
           return `Unknown unit: ${unit}. Available units: bps, kbps, mbps, gbps, tbps`;
       }
-      
-      // Update the network config with the new speed
+
       config.speed = speedInMbps;
       await saveUserNetworkConfig(userId, config);
-      
-      // Recalculate any active downloads
+
+      // Recalculate active downloads
       try {
         const { packageDefinitions, getDownloadStatus, setDownloadStatus } = require("./pkg");
-        const pkgNames = Object.keys(packageDefinitions);
-        
-        for (const pkgName of pkgNames) {
-          const downloadState = getDownloadStatus(userId, pkgName);
-          if (downloadState && downloadState.currentStep < downloadState.steps.length) {
-            // Recalculate remaining steps for this download
-            const updatedState = await recalculateDownloadSteps(userId, pkgName, downloadState);
-            setDownloadStatus(userId, pkgName, updatedState);
+        for (const pkgName of Object.keys(packageDefinitions)) {
+          const ds = getDownloadStatus(userId, pkgName);
+          if (ds && ds.currentStep < ds.steps.length) {
+            const updated = await recalculateDownloadSteps(userId, pkgName, ds);
+            setDownloadStatus(userId, pkgName, updated);
           }
         }
-      } catch (err) {
-        console.error("Error recalculating downloads:", err);
+      } catch (e) {
+        console.error("Error recalculating downloads:", e);
       }
-      
-      // Return a message indicating the change
+
       return `Network speed set to ${value} ${unit.toUpperCase()} (${speedInMbps} Mbps)`;
     },
   },
@@ -220,54 +208,78 @@ Network Simulation: ${config.enabled ? "Enabled" : "Disabled"}`;
 
   netlatency: {
     execute: async (userId, args) => {
-      if (args.length < 1) {
-        return "Usage: netlatency <value in ms>";
-      }
-
+      if (args.length < 1) return "Usage: netlatency <value in ms>";
       const value = parseFloat(args[0]);
-      if (isNaN(value) || value < 0) {
-        return "Invalid latency value. Please provide a non-negative number.";
-      }
+      if (isNaN(value) || value < 0) return "Invalid latency value. Please provide a non-negative number.";
 
+      // Update config
+      const { getUserNetworkConfig, saveUserNetworkConfig, recalculateDownloadSteps } = require("./network");
       const config = await getUserNetworkConfig(userId);
       config.latency = value;
       await saveUserNetworkConfig(userId, config);
+
+      // Recalculate active downloads
+      const { packageDefinitions, getDownloadStatus, setDownloadStatus } = require("./pkg");
+      for (const pkgName of Object.keys(packageDefinitions)) {
+        const ds = getDownloadStatus(userId, pkgName);
+        if (ds && ds.currentStep < ds.steps.length) {
+          const updated = await recalculateDownloadSteps(userId, pkgName, ds);
+          setDownloadStatus(userId, pkgName, updated);
+        }
+      }
+
       return `Network latency set to ${value} ms`;
     },
   },
 
   netjitter: {
     execute: async (userId, args) => {
-      if (args.length < 1) {
-        return "Usage: netjitter <value in ms>";
-      }
-
+      if (args.length < 1) return "Usage: netjitter <value in ms>";
       const value = parseFloat(args[0]);
-      if (isNaN(value) || value < 0) {
-        return "Invalid jitter value. Please provide a non-negative number.";
-      }
+      if (isNaN(value) || value < 0) return "Invalid jitter value. Please provide a non-negative number.";
 
+      // Update config
+      const { getUserNetworkConfig, saveUserNetworkConfig, recalculateDownloadSteps } = require("./network");
       const config = await getUserNetworkConfig(userId);
       config.jitter = value;
       await saveUserNetworkConfig(userId, config);
+
+      // Recalculate active downloads
+      const { packageDefinitions, getDownloadStatus, setDownloadStatus } = require("./pkg");
+      for (const pkgName of Object.keys(packageDefinitions)) {
+        const ds = getDownloadStatus(userId, pkgName);
+        if (ds && ds.currentStep < ds.steps.length) {
+          const updated = await recalculateDownloadSteps(userId, pkgName, ds);
+          setDownloadStatus(userId, pkgName, updated);
+        }
+      }
+
       return `Network jitter set to ${value} ms`;
     },
   },
 
   netloss: {
     execute: async (userId, args) => {
-      if (args.length < 1) {
-        return "Usage: netloss <percentage>";
-      }
-
+      if (args.length < 1) return "Usage: netloss <percentage>";
       const value = parseFloat(args[0]);
-      if (isNaN(value) || value < 0 || value > 100) {
-        return "Invalid packet loss value. Please provide a number between 0 and 100.";
-      }
+      if (isNaN(value) || value < 0 || value > 100) return "Invalid packet loss value. Please provide a number between 0 and 100.";
 
+      // Update config
+      const { getUserNetworkConfig, saveUserNetworkConfig, recalculateDownloadSteps } = require("./network");
       const config = await getUserNetworkConfig(userId);
       config.packetLoss = value;
       await saveUserNetworkConfig(userId, config);
+
+      // Recalculate active downloads
+      const { packageDefinitions, getDownloadStatus, setDownloadStatus } = require("./pkg");
+      for (const pkgName of Object.keys(packageDefinitions)) {
+        const ds = getDownloadStatus(userId, pkgName);
+        if (ds && ds.currentStep < ds.steps.length) {
+          const updated = await recalculateDownloadSteps(userId, pkgName, ds);
+          setDownloadStatus(userId, pkgName, updated);
+        }
+      }
+
       return `Network packet loss set to ${value}%`;
     },
   },
@@ -292,6 +304,7 @@ Network Simulation: ${config.enabled ? "Enabled" : "Disabled"}`;
 };
 
 // Commands that need to be installed via pkg manager
+// Define the structure first, will be populated later by registerPackageCommands
 const installableCommands = {
   echo: {
     execute: async (interaction, userId, args) => {
@@ -337,3 +350,7 @@ module.exports = {
   systemCommands,
   installableCommands,
 };
+
+// Register package commands after everything is exported
+// This helps avoid circular dependency issues
+pkgModule.registerPackageCommands();

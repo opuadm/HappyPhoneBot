@@ -228,20 +228,16 @@ async function handleTerminalInput(interaction, userId) {
   const currentDir = userFS.currentDir;
   const username = interaction.user.username;
 
-  // IMPORTANT FIX: Check for and complete any pending downloads before processing new command
+  // Unlike before, we WON'T force completion of downloads - let them run naturally
+  // Only check for download completion to append messages
   const pkgModule = require("./terminal/pkg");
   const pkgNames = Object.keys(pkgModule.packageDefinitions);
   let downloadMessages = [];
   
-  // Complete all downloads immediately
+  // Only get completed download messages
   for (const pkgName of pkgNames) {
     const downloadState = pkgModule.getDownloadStatus(userId, pkgName);
-    if (downloadState && downloadState.currentStep < downloadState.steps.length) {
-      // Skip to the last step
-      downloadState.currentStep = downloadState.steps.length - 1;
-      pkgModule.setDownloadStatus(userId, pkgName, downloadState);
-      
-      // Process the final step to complete the download
+    if (downloadState && downloadState.currentStep === downloadState.steps.length - 1) {
       const fs = await loadFromDB("user_filesystems", userId, createFilesystem());
       const updateMsg = await pkgModule.processDownload(userId, fs, pkgName, false);
       
@@ -289,7 +285,7 @@ async function handleTerminalInput(interaction, userId) {
   await saveToDB("user_histories", userId, histories);
   await interaction.editReply({ content: `\`\`\`\n${histories.join("\n")}\n\`\`\`` });
 
-  // Start checking for downloads (in the background)
+  // Start checking for downloads with a slight delay
   setTimeout(() => checkActiveDownloads(userId, interaction, histories), 500);
 }
 
@@ -306,12 +302,26 @@ async function checkActiveDownloads(userId, interaction, histories) {
     const pkgModule = require("./terminal/pkg");
     const pkgNames = Object.keys(pkgModule.packageDefinitions);
 
+    // Also check for OS updates
+    const updateNames = [];
+    const userFS = await loadFromDB("user_filesystems", userId, createFilesystem());
+    const currentBranch = userFS.fs["/"].children.sys.children.os_branch?.content || "stable";
+    const branchUpdates = Object.entries(pkgModule.osBranches)
+      .filter(([branch]) => branch === currentBranch)
+      .map(([_, version]) => `update-${version}`);
+    updateNames.push(...branchUpdates);
+
+    // Combine package names and update names to check
+    const allDownloadsToCheck = [...pkgNames, ...updateNames];
+    
     let hasUpdates = false;
     let downloadCompleted = false;
+    let checkAgain = false;
 
-    for (const pkgName of pkgNames) {
+    for (const pkgName of allDownloadsToCheck) {
       const downloadState = pkgModule.getDownloadStatus(userId, pkgName);
       if (downloadState && downloadState.currentStep < downloadState.steps.length) {
+        checkAgain = true;
         // Get fresh filesystem for updating
         const fs = await loadFromDB("user_filesystems", userId, createFilesystem());
 
@@ -325,6 +335,9 @@ async function checkActiveDownloads(userId, interaction, histories) {
           // Move to next step
           downloadState.currentStep++;
           downloadState.lastUpdate = now;
+          
+          // Save the updated download state
+          pkgModule.setDownloadStatus(userId, pkgName, downloadState);
           
           // Process the step (this will install the package if complete)
           const updateMsg = await pkgModule.processDownload(userId, fs, pkgName, false);
@@ -355,14 +368,10 @@ async function checkActiveDownloads(userId, interaction, histories) {
     }
 
     // Continue checking if there are active downloads
-    const hasActiveDownloads = pkgNames.some((pkgName) => {
-      const state = pkgModule.getDownloadStatus(userId, pkgName);
-      return state && state.currentStep < state.steps.length;
-    });
-
-    if (hasActiveDownloads) {
-      // Set up next check in 100ms for more frequent updates
-      setTimeout(() => checkActiveDownloads(userId, interaction, histories), 100);
+    if (checkAgain) {
+      // Set up next check in 500ms for more realistic download updates
+      // This is frequent enough to look responsive but not too frequent to cause rate limits
+      setTimeout(() => checkActiveDownloads(userId, interaction, histories), 500);
     }
 
     return hasUpdates;
