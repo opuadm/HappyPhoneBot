@@ -29,13 +29,18 @@ export async function loadFromDB(table, userId, defaultValue = {}) {
     
     if (!row) return defaultValue;
     
-    // Handle different table columns
-    if (table === 'user_histories') {
-        return JSON.parse(row.history || '[]');
-    } else if (table === 'user_filesystems') {
-        return JSON.parse(row.filesystem || '{}');
-    } else if (table === 'user_network_configs') {
-        return JSON.parse(row.config || '{}');
+    try {
+        // Handle different table columns
+        if (table === 'user_histories') {
+            return JSON.parse(row.history || '[]');
+        } else if (table === 'user_filesystems') {
+            return JSON.parse(row.filesystem || '{}');
+        } else if (table === 'user_network_configs') {
+            return JSON.parse(row.config || '{}');
+        }
+    } catch (error) {
+        console.error("JSON parse error in loadFromDB:", error);
+        return defaultValue;
     }
     
     return defaultValue;
