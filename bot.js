@@ -145,5 +145,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
+// Discord Android/iOS = Mobile Status
+// Discord Web = Browser (Default)
+// Discord Embedded = Gaming Console Status
 DefaultWebSocketManagerOptions.identifyProperties.browser = "Discord Android";
 client.login(process.env.DISCORD_TOKEN).catch(console.error);
